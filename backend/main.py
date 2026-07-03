@@ -1,45 +1,31 @@
 import streamlit as st
-import time
+from openai import OpenAI
 
-# 1. Setup the UI (This replaces your FastAPI app instantiation and root endpoint)
-st.set_page_config(page_title="OmniSearch AI", page_icon="🔍")
-st.title("OmniSearch AI 🔍")
-st.caption("Welcome to the OmniSearch AI. System is running.")
+# Initialize the OpenAI client using Streamlit Secrets
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# 2. Initialize chat history in session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ... [Keep your page config and chat history code exactly as it is] ...
 
-# 3. Display previous chat messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# 4. Handle New User Input (This replaces your @app.post("/api/chat") endpoint)
+# 4. Handle New User Input
 if prompt := st.chat_input("Ask a question about your documents..."):
     
-    # Show user message
     with st.chat_message("user"):
         st.markdown(prompt)
-    
-    # Save user message to history
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # --- MOCK RAG/LLM LOGIC ---
-    # In the future, you will replace this block with your Pinecone/OpenAI code
+    # --- REAL AI LOGIC ---
     with st.chat_message("assistant"):
-        with st.spinner("Searching documents..."):
-            time.sleep(1) # Simulating a slight delay for realism
+        with st.spinner("Thinking..."):
             
-            mock_answer = "This is an AI-generated answer retrieved from your fragmented documents."
-            mock_citations = ["HR_Handbook.pdf - Page 4", "Company_Policy_Notion_Page"]
+            # Send the entire chat history to OpenAI so it remembers the conversation
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",  # Fast, affordable, and smart
+                messages=st.session_state.messages
+            )
             
-            # Format the output beautifully for Streamlit
-            response_text = f"{mock_answer}\n\n**Citations:**\n"
-            for citation in mock_citations:
-                response_text += f"* `{citation}`\n"
+            # Extract the AI's actual answer
+            ai_answer = response.choices[0].message.content
             
-            st.markdown(response_text)
+            st.markdown(ai_answer)
             
-    # Save assistant message to history
-    st.session_state.messages.append({"role": "assistant", "content": response_text})
+    st.session_state.messages.append({"role": "assistant", "content": ai_answer})
