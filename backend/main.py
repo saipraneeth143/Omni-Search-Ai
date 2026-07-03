@@ -81,7 +81,7 @@ if prompt := st.chat_input("Ask something about your uploaded documents..."):
                 
                 # We also ensure temperature is a float (0.0) to satisfy strict API requirements
                 llm = ChatGoogleGenerativeAI(
-                    model="gemini-1.5-flash", 
+                    model="gemini-2.5-flash", 
                     temperature=0.0,
                     safety_settings=safety_settings
                 )
