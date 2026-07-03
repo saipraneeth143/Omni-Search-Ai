@@ -69,16 +69,13 @@ if prompt := st.chat_input("Ask something about your uploaded documents..."):
                 # Setup Google Gemini LLM
                 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
                 
-                system_prompt = (
+                prompt_template = ChatPromptTemplate.from_template(
                     "You are an assistant for question-answering tasks. "
                     "Use the following pieces of retrieved context to answer the question. "
                     "If you don't know the answer, say that you don't know.\n\n"
-                    "{context}"
-                )
-                prompt_template = ChatPromptTemplate.from_messages([
-                    ("system", system_prompt),
-                    ("human", "{input}"),
-                ])
+                    "Context:\n{context}\n\n"
+                    "Question: {input}"
+                                          )
                 
                 question_answer_chain = create_stuff_documents_chain(llm, prompt_template)
                 rag_chain = create_retrieval_chain(retriever, question_answer_chain)
