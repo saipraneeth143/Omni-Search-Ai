@@ -2,7 +2,7 @@ import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
@@ -39,11 +39,16 @@ with st.sidebar:
             loader = PyPDFLoader(temp_file_path)
             docs = loader.load()
             
+            # CRITICAL FIX 1: Strip invisible null bytes (\x00) from the PDF text. 
+            # If we don't do this, Gemini will instantly crash with a 400 Bad Request.
+            for doc in docs:
+                doc.page_content = doc.page_content.replace('\x00', '')
+            
             # 2. Split text into manageable chunks
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             final_documents = text_splitter.split_documents(docs)
             
-            # 3. Create Embeddings using Google's free embedding model
+            # 3. Create Embeddings
             embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
             st.session_state.vector_store = FAISS.from_documents(final_documents, embeddings)
             
@@ -66,16 +71,31 @@ if prompt := st.chat_input("Ask something about your uploaded documents..."):
             if st.session_state.vector_store is not None:
                 retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
                 
-                # Setup Google Gemini LLM
-                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+                # CRITICAL FIX 2: Turn off Gemini's strict safety filters so it doesn't block PDF chunks.
+                safety_settings = {
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
                 
-                prompt_template = ChatPromptTemplate.from_template(
+                # We also ensure temperature is a float (0.0) to satisfy strict API requirements
+                llm = ChatGoogleGenerativeAI(
+                    model="gemini-1.5-flash", 
+                    temperature=0.0,
+                    safety_settings=safety_settings
+                )
+                
+                system_prompt = (
                     "You are an assistant for question-answering tasks. "
                     "Use the following pieces of retrieved context to answer the question. "
                     "If you don't know the answer, say that you don't know.\n\n"
-                    "Context:\n{context}\n\n"
-                    "Question: {input}"
-                                          )
+                    "Context:\n{context}"
+                )
+                prompt_template = ChatPromptTemplate.from_messages([
+                    ("system", system_prompt),
+                    ("human", "{input}"),
+                ])
                 
                 question_answer_chain = create_stuff_documents_chain(llm, prompt_template)
                 rag_chain = create_retrieval_chain(retriever, question_answer_chain)
@@ -90,7 +110,7 @@ if prompt := st.chat_input("Ask something about your uploaded documents..."):
                 full_response = answer + citation_text
                 
             else:
-                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.0)
                 full_response = llm.predict(prompt) + "\n\n*(Note: No document uploaded. Answering using base knowledge)*"
 
             st.markdown(full_response)
