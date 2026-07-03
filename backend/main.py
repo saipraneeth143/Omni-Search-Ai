@@ -44,7 +44,7 @@ with st.sidebar:
             final_documents = text_splitter.split_documents(docs)
             
             # 3. Create Embeddings using Google's free embedding model
-            embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+            embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
             st.session_state.vector_store = FAISS.from_documents(final_documents, embeddings)
             
             os.remove(temp_file_path)
