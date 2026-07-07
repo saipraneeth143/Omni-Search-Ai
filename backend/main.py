@@ -47,11 +47,29 @@ with st.sidebar:
             # 2. Split text into manageable chunks
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             final_documents = text_splitter.split_documents(docs)
-            
+
+            # CRITICAL FIX 3: Guard against PDFs with no extractable text
+            # (e.g. scanned/image-only PDFs). Without this check, FAISS.from_documents
+            # receives an empty list, embed_documents([]) returns [], and
+            # faiss.IndexFlatL2(len(embeddings[0])) crashes with an IndexError.
+            if not final_documents:
+                os.remove(temp_file_path)
+                st.error(
+                    "⚠️ No readable text was found in this PDF. It may be a scanned "
+                    "or image-only document. Please try a PDF with selectable text "
+                    "(or run it through OCR first)."
+                )
+                st.stop()
+
             # 3. Create Embeddings
-            embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
-            st.session_state.vector_store = FAISS.from_documents(final_documents, embeddings)
-            
+            try:
+                embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
+                st.session_state.vector_store = FAISS.from_documents(final_documents, embeddings)
+            except Exception as e:
+                os.remove(temp_file_path)
+                st.error(f"Failed to build the vector index: {e}")
+                st.stop()
+
             os.remove(temp_file_path)
             st.success(f"Successfully indexed {len(final_documents)} chunks from {uploaded_file.name}!")
 
@@ -110,8 +128,12 @@ if prompt := st.chat_input("Ask something about your uploaded documents..."):
                 full_response = answer + citation_text
                 
             else:
-                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.0)
-                full_response = llm.predict(prompt) + "\n\n*(Note: No document uploaded. Answering using base knowledge)*"
+                # CRITICAL FIX 4: .predict() was deprecated in LangChain 0.1.7 and is
+                # removed in current versions — use .invoke().content instead.
+                # Also switched to gemini-2.5-flash for consistency with the RAG path
+                # above (gemini-1.5-flash is an older model).
+                llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.0)
+                full_response = llm.invoke(prompt).content + "\n\n*(Note: No document uploaded. Answering using base knowledge)*"
 
             st.markdown(full_response)
             
