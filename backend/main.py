@@ -41,8 +41,11 @@ st.markdown("""
     }
 
     /* ── Hide Streamlit defaults ────────────────────── */
-    #MainMenu, footer, header { visibility: hidden; }
-    .stDeployButton { display: none; }
+    #MainMenu, footer { visibility: hidden; }
+   header {
+    background: transparent !important;
+    box-shadow: none !important;
+}
 
     /* ── Custom Scrollbar ───────────────────────────── */
     ::-webkit-scrollbar { width: 6px; }
