@@ -358,8 +358,8 @@ with st.sidebar:
 
                     # 5. Create embeddings and vector store
                     embeddings = GoogleGenerativeAIEmbeddings(
-                        model="models/text-embedding-004"
-                    )
+                     model="models/gemini-embedding-001"
+                                                )
                     st.session_state.vector_store = FAISS.from_documents(chunks, embeddings)
 
                     # 6. Store document metadata in session state
