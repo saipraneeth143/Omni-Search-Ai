@@ -21,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 st.set_page_config(
     page_title="OmniSearch AI",
     page_icon="🔮",
-    layout="narrow",
+    layout="wide",
     initial_sidebar_state="expanded",
 )
 
