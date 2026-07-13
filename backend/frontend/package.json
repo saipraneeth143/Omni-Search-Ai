@@ -1,18 +1,1 @@
-{
-  "name": "omnisearch-frontend",
-  "version": "0.1.0",
-  "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
-  },
-  "dependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "next": "^14.0.0",
-    "tailwindcss": "^3.3.0",
-    "lucide-react": "^0.292.0"
-  },
-  "description": "Frontend UI for the OmniSearch AI Assistant"
-}
+
