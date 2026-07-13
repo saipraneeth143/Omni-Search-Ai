@@ -89,19 +89,45 @@ st.markdown("""
         font-weight: 500 !important;
     }
 
-    [data-testid="stFileUploader"] button {
+   [data-testid="stFileUploader"] button {
         background: linear-gradient(135deg, #00D4FF, #7C3AED) !important;
-        color: white !important;
         border: none !important;
         border-radius: 8px !important;
         font-weight: 600 !important;
         transition: all 0.3s ease !important;
+        position: relative !important;
+        overflow: hidden !important;
+        min-width: 118px !important;
+        min-height: 34px !important;
+        white-space: nowrap !important;
+    }
+
+    /* Hide whatever Streamlit renders natively inside the button
+       (icon, label, or any duplicate text causing the overlap) */
+    [data-testid="stFileUploader"] button * {
+        visibility: hidden !important;
+    }
+
+    /* Draw exactly one clean label on top, fully under our control */
+    [data-testid="stFileUploader"] button::after {
+        content: "Browse files";
+        visibility: visible !important;
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: 600;
+        font-size: 0.85rem;
+        white-space: nowrap;
     }
 
     [data-testid="stFileUploader"] button:hover {
         transform: translateY(-1px);
         box-shadow: 0 4px 15px rgba(0, 212, 255, 0.3) !important;
     }
+    
 
     /* ── Chat Messages ── Custom Bubbles ──────────────── */
     [data-testid="stChatMessage"] {
