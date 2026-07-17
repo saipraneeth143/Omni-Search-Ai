@@ -48,6 +48,19 @@ from langchain_google_genai import (
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+try:
+    from langdetect import DetectorFactory, LangDetectException, detect
+
+    DetectorFactory.seed = 0  # deterministic detection results
+    _LANGDETECT_AVAILABLE = True
+except ModuleNotFoundError:
+    # Deployment hasn't picked up the new dependency yet. Language answering
+    # still works via the manual dropdown; only auto-detect degrades to "en".
+    _LANGDETECT_AVAILABLE = False
+
+    class LangDetectException(Exception):
+        pass
+
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
@@ -115,6 +128,97 @@ PERSONAS = {
         "Be concise and actionable."
     ),
 }
+
+# --------------------------------------------------------------------------
+# Multi-language answering
+# --------------------------------------------------------------------------
+# Display name -> ISO 639-1 code (what langdetect returns) shown in the UI
+# dropdown. "Auto-detect" (None) means: infer the language from the user's
+# question itself, so a Hindi question gets a Hindi answer even if every
+# indexed document is in English — Gemini's embeddings are cross-lingual,
+# so retrieval still works, only the final generation step needs steering.
+SUPPORTED_LANGUAGES = {
+    "Auto-detect": None,
+    "English": "en",
+    "Hindi": "hi",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Portuguese": "pt",
+    "Arabic": "ar",
+    "Chinese (Simplified)": "zh-cn",
+    "Japanese": "ja",
+    "Russian": "ru",
+    "Telugu": "te",
+    "Tamil": "ta",
+    "Bengali": "bn",
+    "Urdu": "ur",
+}
+LANG_CODE_TO_NAME = {code: name for name, code in SUPPORTED_LANGUAGES.items() if code}
+DEFAULT_LANG_CODE = "en"
+
+# Localized copies of the "not found in this knowledge base" message, so the
+# one sentence a user is most likely to see when the KB is incomplete still
+# reads naturally in their language instead of silently falling back to
+# English. Anything outside this set falls back to the LLM-authored answer
+# language (which still works — this dict only covers the static string).
+GAP_MESSAGE = (
+    "I couldn't find this in the current knowledge base. It may not have "
+    "been added yet, or the documents that cover it haven't been uploaded "
+    "to this space."
+)
+GAP_MESSAGES = {
+    "en": GAP_MESSAGE,
+    "hi": "मुझे यह वर्तमान नॉलेज बेस में नहीं मिला। हो सकता है यह अभी तक जोड़ा न गया हो, या इससे जुड़े दस्तावेज़ इस स्पेस में अपलोड नहीं किए गए हों।",
+    "es": "No pude encontrar esto en la base de conocimientos actual. Puede que aún no se haya añadido, o que los documentos correspondientes no se hayan subido a este espacio.",
+    "fr": "Je n'ai pas trouvé cette information dans la base de connaissances actuelle. Elle n'a peut-être pas encore été ajoutée, ou les documents correspondants n'ont pas été chargés dans cet espace.",
+    "de": "Ich konnte dies in der aktuellen Wissensdatenbank nicht finden. Möglicherweise wurde es noch nicht hinzugefügt, oder die entsprechenden Dokumente wurden noch nicht in diesen Bereich hochgeladen.",
+    "pt": "Não encontrei essa informação na base de conhecimento atual. Ela pode ainda não ter sido adicionada, ou os documentos correspondentes não foram enviados a este espaço.",
+    "ar": "لم أتمكن من العثور على هذا في قاعدة المعرفة الحالية. ربما لم تتم إضافته بعد، أو أن المستندات ذات الصلة لم يتم رفعها إلى هذا القسم.",
+    "zh-cn": "我在当前知识库中找不到相关信息。可能尚未添加,或者相关文档还没有上传到这个空间。",
+    "ja": "現在のナレッジベースにはこの情報が見つかりませんでした。まだ追加されていないか、関連する文書がこのスペースにアップロードされていない可能性があります。",
+    "ru": "Я не нашёл эту информацию в текущей базе знаний. Возможно, она ещё не добавлена, либо соответствующие документы не загружены в это пространство.",
+    "te": "ఇది ప్రస్తుత నాలెడ్జ్ బేస్‌లో నాకు కనిపించలేదు. ఇది ఇంకా జోడించబడి ఉండకపోవచ్చు, లేదా సంబంధిత పత్రాలు ఈ స్పేస్‌లో అప్‌లోడ్ చేయబడి ఉండకపోవచ్చు.",
+    "ta": "இது தற்போதைய அறிவுத் தளத்தில் எனக்குக் கிடைக்கவில்லை. இது இன்னும் சேர்க்கப்படாமல் இருக்கலாம், அல்லது தொடர்புடைய ஆவணங்கள் இந்த இடத்தில் பதிவேற்றப்படாமல் இருக்கலாம்.",
+    "bn": "আমি বর্তমান নলেজ বেসে এটি খুঁজে পাইনি। এটি হয়তো এখনও যোগ করা হয়নি, অথবা সংশ্লিষ্ট নথিগুলো এই স্পেসে আপলোড করা হয়নি।",
+    "ur": "مجھے یہ موجودہ نالج بیس میں نہیں ملا۔ ہو سکتا ہے یہ ابھی شامل نہ کیا گیا ہو، یا متعلقہ دستاویزات اس اسپیس میں اپ لوڈ نہ کی گئی ہوں۔",
+}
+
+
+def detect_language(text: str) -> str:
+    """Best-effort ISO 639-1 code for the language a question is written in.
+
+    Falls back to English when the text is too short for reliable detection
+    (langdetect is noisy under ~4 characters, e.g. "PTO?"), when the
+    dependency isn't installed, or when detection throws for any reason —
+    auto-detect should never be the thing that breaks a chat response.
+    """
+    if not _LANGDETECT_AVAILABLE or len(text.strip()) < 4:
+        return DEFAULT_LANG_CODE
+    try:
+        code = detect(text)
+    except LangDetectException:
+        return DEFAULT_LANG_CODE
+    # langdetect sometimes returns close variants (e.g. "hi" vs "mr" for
+    # short Devanagari strings); only trust codes we actually support a
+    # localized experience for, otherwise fall back to English rather than
+    # silently answering in a language nobody selected.
+    return code if code in LANG_CODE_TO_NAME else DEFAULT_LANG_CODE
+
+
+def resolve_answer_language(query: str, selected_language: str) -> tuple[str, str]:
+    """Returns (lang_code, lang_name) given the sidebar selection.
+
+    selected_language is a key of SUPPORTED_LANGUAGES. "Auto-detect" defers
+    to the question's own language; anything else pins the answer language
+    regardless of what language the source documents or the question are in.
+    """
+    if selected_language == "Auto-detect" or not selected_language:
+        code = detect_language(query)
+    else:
+        code = SUPPORTED_LANGUAGES.get(selected_language, DEFAULT_LANG_CODE)
+    return code, LANG_CODE_TO_NAME.get(code, "English")
+
 
 SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
@@ -283,36 +387,59 @@ def _is_gap_response(raw: str) -> bool:
     return cleaned.startswith(NOT_FOUND_TOKEN) or (NOT_FOUND_TOKEN in cleaned and len(cleaned) < 40)
 
 
-def _build_prompt(persona: str) -> ChatPromptTemplate:
+def _build_prompt(persona: str, answer_lang_name: str) -> ChatPromptTemplate:
     persona_instruction = PERSONAS.get(persona, PERSONAS["General"])
+    language_instruction = (
+        f"Write your entire answer in {answer_lang_name}, even if the context "
+        f"below is written in a different language and even if the question "
+        f"was asked in a different language. Translate faithfully: do not add, "
+        f"omit, or guess at information while translating. Keep proper nouns, "
+        f"product names, and numbers/dates in their original form unless a "
+        f"localized form is clearly more natural in {answer_lang_name}.\n\n"
+    )
     system_prompt = (
         f"{persona_instruction}\n\n"
+        f"{language_instruction}"
         "Answer the user's question using ONLY the context below, which comes "
         "from the organization's own knowledge base. Do not use any outside "
         "knowledge, even if you happen to know the answer generally — this "
         "assistant must only ever speak from what has actually been uploaded.\n\n"
         f"If, and only if, the context genuinely does not contain enough "
         f"information to answer, reply with exactly this token and nothing "
-        f"else: {NOT_FOUND_TOKEN}\n\n"
+        f"else (do not translate the token itself): {NOT_FOUND_TOKEN}\n\n"
         "Context:\n{context}"
     )
     return ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
 
 
-def answer_question(vs, query: str, persona: str, llm, k: int = 4) -> dict:
+def answer_question(
+    vs, query: str, persona: str, llm, answer_language: str = "Auto-detect", k: int = 4
+) -> dict:
+    lang_code, lang_name = resolve_answer_language(query, answer_language)
+    localized_gap = GAP_MESSAGES.get(lang_code, GAP_MESSAGE)
+
     docs = vs.similarity_search(query, k=k)
     if not docs:
-        return {"answer": GAP_MESSAGE, "sources": [], "pages": [], "status": "gap"}
+        return {
+            "answer": localized_gap, "sources": [], "pages": [], "status": "gap",
+            "language": lang_name, "language_code": lang_code,
+        }
 
-    chain = create_stuff_documents_chain(llm, _build_prompt(persona))
+    chain = create_stuff_documents_chain(llm, _build_prompt(persona, lang_name))
     raw = call_with_retry(chain.invoke, {"input": query, "context": docs})
 
     if _is_gap_response(raw):
-        return {"answer": GAP_MESSAGE, "sources": [], "pages": [], "status": "gap"}
+        return {
+            "answer": localized_gap, "sources": [], "pages": [], "status": "gap",
+            "language": lang_name, "language_code": lang_code,
+        }
 
     sources = sorted({d.metadata.get("source", "Unknown") for d in docs})
     pages = sorted({(d.metadata.get("page", 0) or 0) + 1 for d in docs})
-    return {"answer": raw, "sources": sources, "pages": pages, "status": "answered"}
+    return {
+        "answer": raw, "sources": sources, "pages": pages, "status": "answered",
+        "language": lang_name, "language_code": lang_code,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -341,7 +468,9 @@ def read_jsonl(path: str) -> list:
     return rows
 
 
-def log_interaction(space: str, persona: str, query: str, status: str, sources: list):
+def log_interaction(
+    space: str, persona: str, query: str, status: str, sources: list, language: str = "English"
+):
     _append_jsonl(QUERY_LOG, {
         "ts": datetime.now(timezone.utc).isoformat(),
         "space": space,
@@ -349,6 +478,7 @@ def log_interaction(space: str, persona: str, query: str, status: str, sources: 
         "query": query,
         "status": status,
         "sources": sources,
+        "language": language,
     })
 
 
@@ -368,9 +498,12 @@ def get_analytics(space: str) -> dict:
     answered = sum(1 for r in rows if r.get("status") == "answered")
     gaps = [r for r in rows if r.get("status") == "gap"]
     by_persona: dict = {}
+    by_language: dict = {}
     for r in rows:
         p = r.get("persona", "General")
         by_persona[p] = by_persona.get(p, 0) + 1
+        lang = r.get("language", "English")
+        by_language[lang] = by_language.get(lang, 0) + 1
     return {
         "total_queries": total,
         "answered": answered,
@@ -378,6 +511,7 @@ def get_analytics(space: str) -> dict:
         "resolution_rate": round(100 * answered / total, 1) if total else 0.0,
         "gaps": list(reversed(gaps))[:25],
         "by_persona": by_persona,
+        "by_language": by_language,
     }
 
 
@@ -390,18 +524,22 @@ def get_escalations(space: str) -> list:
 # Automation: Auto-FAQ generator
 # --------------------------------------------------------------------------
 
-def generate_faq(vs, llm, space: str, max_chunks: int = 40):
+def generate_faq(vs, llm, space: str, language: str = "English", max_chunks: int = 40):
     all_docs = list(vs.docstore._dict.values())  # noqa: SLF001 - no public "list all" API on FAISS wrapper
     if not all_docs:
         return None
     sample = all_docs[:max_chunks]
     context_text = "\n\n---\n\n".join(d.page_content[:800] for d in sample)
+    lang_name = language if language and language != "Auto-detect" else "English"
     prompt = (
         f"You are creating an FAQ document from the knowledge base content below, "
         f"for a knowledge space called \"{space}\". Identify the 8-12 most useful "
         "questions someone would realistically ask about this content, and answer "
-        "each one concisely and accurately using ONLY the content given. Format the "
-        "output as markdown, using '### Q: ...' followed by 'A: ...' for each pair.\n\n"
+        "each one concisely and accurately using ONLY the content given. Write both "
+        f"the questions and answers in {lang_name}, even though the source content "
+        "below may be in a different language — translate faithfully without adding "
+        "or omitting information. Format the output as markdown, using '### Q: ...' "
+        "followed by 'A: ...' for each pair.\n\n"
         f"Content:\n{context_text}"
     )
     resp = call_with_retry(llm.invoke, prompt)
