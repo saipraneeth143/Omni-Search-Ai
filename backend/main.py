@@ -567,6 +567,25 @@ with st.sidebar:
         st.caption(f"All answers in this space will be written in {answer_language}.")
 
     st.divider()
+    st.markdown("### 🔎 Answer Verification")
+    verify_answers = st.checkbox(
+        "Double-check answers before showing them",
+        value=True,
+        key="verify_answers",
+        help=(
+            "Runs two extra checks on every answer: a plain string match "
+            "confirming any numbers/dates it cites actually appear in the "
+            "source documents, plus one additional AI pass re-checking the "
+            "answer against its own context. Adds a little latency and one "
+            "extra API call per question — turn off to save both."
+        ),
+    )
+    if verify_answers:
+        st.caption("Flags unsupported figures or claims instead of hiding them.")
+    else:
+        st.caption("Off — answers are shown without the extra verification pass.")
+
+    st.divider()
     st.markdown("### 📥 Add Knowledge")
     if not active_space:
         st.info("Create or select a space above first.")
@@ -691,10 +710,19 @@ with tab_chat:
                 st.session_state[history_key].append({"role": "assistant", "content": msg})
             else:
                 with st.spinner("Searching the knowledge base..."):
-                    result = answer_question(vs, prompt, persona, llm, answer_language=answer_language)
+                    result = answer_question(
+                        vs, prompt, persona, llm,
+                        answer_language=answer_language, verify=verify_answers,
+                    )
+
+                unverified = result["fact_check"].get("unverified", [])
+                critique = result["critique"]
+                critique_issues = critique.get("issues", []) if not critique.get("passed", True) else []
+                verification_flagged = bool(unverified or critique_issues)
+
                 log_interaction(
                     active_space, persona, prompt, result["status"], result["sources"],
-                    language=result["language"],
+                    language=result["language"], verification_flagged=verification_flagged,
                 )
 
                 lang_note = (
@@ -702,6 +730,21 @@ with tab_chat:
                     if answer_language == "Auto-detect"
                     else f"🌐 Replied in {result['language']}."
                 )
+
+                verification_note = ""
+                if result["status"] == "answered" and verify_answers:
+                    if verification_flagged:
+                        parts = []
+                        if unverified:
+                            parts.append(f"figures not found verbatim in the source text: {', '.join(unverified)}")
+                        if critique_issues:
+                            parts.append(f"claims the self-check couldn't confirm: {', '.join(critique_issues)}")
+                        verification_note = (
+                            "\n\n⚠️ **Verification flags** — " + "; ".join(parts) +
+                            ". Worth double-checking before relying on this."
+                        )
+                    elif result["fact_check"].get("checked") or critique.get("checked"):
+                        verification_note = "\n\n✅ Verified: figures and claims traced to the source documents above."
 
                 if result["status"] == "gap":
                     st.warning(result["answer"])
@@ -714,7 +757,7 @@ with tab_chat:
                 else:
                     pages_str = ", ".join(str(p) for p in result["pages"])
                     sources_str = ", ".join(result["sources"])
-                    full = f"{result['answer']}\n\n**Sources:** {sources_str} (pages {pages_str})"
+                    full = f"{result['answer']}\n\n**Sources:** {sources_str} (pages {pages_str}){verification_note}"
                     st.markdown(full)
                     st.caption(f"✅ Answered from the knowledge base above. {lang_note}")
                     st.session_state[history_key].append({"role": "assistant", "content": full})
@@ -728,8 +771,9 @@ with tab_analytics:
         ("✅", "Answered", stats["answered"], "#10B981"),
         ("🕳️", "Knowledge gaps", stats["gap_count"], "#F59E0B"),
         ("📈", "Resolution rate", f"{stats['resolution_rate']}%", "#22D3EE"),
+        ("🔍", "Verification flags", stats.get("verification_flagged", 0), "#F472B6"),
     ]
-    cols = st.columns(4)
+    cols = st.columns(5)
     for col, (icon, label, value, color) in zip(cols, kpi_defs):
         col.markdown(
             f"""
