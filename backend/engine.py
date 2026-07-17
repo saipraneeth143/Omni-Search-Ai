@@ -34,10 +34,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-import requests
 import streamlit as st
-from bs4 import BeautifulSoup
-from docx import Document as DocxReader
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
@@ -223,6 +220,13 @@ def load_pdf_docs(path: str, filename: str):
 
 
 def load_docx_docs(path: str, filename: str):
+    try:
+        from docx import Document as DocxReader
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "The 'python-docx' package isn't installed on this deployment. "
+            "Add `python-docx==1.1.2` to requirements.txt and reboot the app."
+        ) from e
     reader = DocxReader(path)
     text = "\n".join(p.text for p in reader.paragraphs if p.text.strip())
     return [Document(page_content=_clean(text), metadata={"source": filename, "page": 0})]
@@ -235,6 +239,15 @@ def load_txt_docs(path: str, filename: str):
 
 
 def load_url_docs(url: str):
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "The 'requests'/'beautifulsoup4' packages aren't installed on this "
+            "deployment. Add `beautifulsoup4==4.12.3` and `requests==2.32.3` to "
+            "requirements.txt and reboot the app."
+        ) from e
     resp = requests.get(url, timeout=15, headers={"User-Agent": "OmniSearchAI/1.0"})
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
