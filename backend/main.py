@@ -79,10 +79,8 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-
         html, body, [class*="css"]  {
-            font-family: 'Inter', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif;
         }
 
         :root {
@@ -100,27 +98,11 @@ st.markdown(
 
         /* ---------- Dynamic cosmic background ---------- */
         .stApp {
-            background: radial-gradient(ellipse 80% 60% at 15% -10%, rgba(99,102,241,0.35), transparent 60%),
-                        radial-gradient(ellipse 70% 60% at 100% 0%, rgba(34,211,238,0.22), transparent 55%),
-                        radial-gradient(ellipse 60% 50% at 50% 100%, rgba(129,140,248,0.16), transparent 60%),
+            background: radial-gradient(ellipse 80% 60% at 15% -10%, rgba(99,102,241,0.30), transparent 60%),
+                        radial-gradient(ellipse 70% 60% at 100% 0%, rgba(34,211,238,0.18), transparent 55%),
+                        radial-gradient(ellipse 60% 50% at 50% 100%, rgba(129,140,248,0.14), transparent 60%),
                         linear-gradient(180deg, #06070F 0%, #0A0C1B 45%, #0B0E1E 100%);
             background-attachment: fixed;
-            position: relative;
-        }
-        .stApp::before {
-            content: "";
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
-            z-index: 0;
-            background:
-                radial-gradient(circle at 20% 30%, rgba(34,211,238,0.10), transparent 35%),
-                radial-gradient(circle at 85% 65%, rgba(129,140,248,0.14), transparent 40%);
-            animation: os-drift 18s ease-in-out infinite alternate;
-        }
-        @keyframes os-drift {
-            0%   { transform: translate3d(0,0,0) scale(1); }
-            100% { transform: translate3d(-2%, 2%, 0) scale(1.06); }
         }
         [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
             background: transparent;
