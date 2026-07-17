@@ -5,6 +5,7 @@ import streamlit as st
 
 from engine import (
     PERSONAS,
+    SUPPORTED_LANGUAGES,
     _slug,
     generate_faq,
     get_analytics,
@@ -548,6 +549,24 @@ with st.sidebar:
     st.caption(PERSONAS[persona])
 
     st.divider()
+    st.markdown("### 🌐 Answer Language")
+    answer_language = st.selectbox(
+        "Reply in",
+        list(SUPPORTED_LANGUAGES.keys()),
+        index=0,
+        key="answer_language",
+        help=(
+            "Auto-detect replies in whatever language you type your question in. "
+            "Pick a specific language to always get answers in that language, "
+            "even if your documents are in a different one."
+        ),
+    )
+    if answer_language == "Auto-detect":
+        st.caption("I'll match the language of each question you ask.")
+    else:
+        st.caption(f"All answers in this space will be written in {answer_language}.")
+
+    st.divider()
     st.markdown("### 📥 Add Knowledge")
     if not active_space:
         st.info("Create or select a space above first.")
@@ -672,11 +691,21 @@ with tab_chat:
                 st.session_state[history_key].append({"role": "assistant", "content": msg})
             else:
                 with st.spinner("Searching the knowledge base..."):
-                    result = answer_question(vs, prompt, persona, llm)
-                log_interaction(active_space, persona, prompt, result["status"], result["sources"])
+                    result = answer_question(vs, prompt, persona, llm, answer_language=answer_language)
+                log_interaction(
+                    active_space, persona, prompt, result["status"], result["sources"],
+                    language=result["language"],
+                )
+
+                lang_note = (
+                    f"🌐 Auto-detected: replied in {result['language']}."
+                    if answer_language == "Auto-detect"
+                    else f"🌐 Replied in {result['language']}."
+                )
 
                 if result["status"] == "gap":
                     st.warning(result["answer"])
+                    st.caption(lang_note)
                     flag_key = f"flag_{active_space}_{len(st.session_state[history_key])}"
                     if st.button("🚩 Flag this for a human expert", key=flag_key):
                         log_escalation(active_space, persona, prompt)
@@ -687,7 +716,7 @@ with tab_chat:
                     sources_str = ", ".join(result["sources"])
                     full = f"{result['answer']}\n\n**Sources:** {sources_str} (pages {pages_str})"
                     st.markdown(full)
-                    st.caption("✅ Answered from the knowledge base above.")
+                    st.caption(f"✅ Answered from the knowledge base above. {lang_note}")
                     st.session_state[history_key].append({"role": "assistant", "content": full})
 
 # ------------------------------ Analytics ----------------------------------
@@ -738,6 +767,32 @@ with tab_analytics:
             </div>
             """
         st.markdown(f'<div>{_bars_html}</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if stats.get("by_language"):
+        st.markdown('<div class="os-card">', unsafe_allow_html=True)
+        st.markdown('<div class="os-section-title">🌐 Queries by language</div>', unsafe_allow_html=True)
+        st.caption("Which languages people are actually asking questions in — useful for spotting where to prioritize document translation.")
+        _lang_data = stats["by_language"]
+        _litems = list(_lang_data.items())
+        _lmax = max((v for _, v in _litems), default=0) or 1
+        _lpalette = ["#22D3EE", "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#A78BFA", "#F87171"]
+        _lbars_html = ""
+        for _i, (_label, _val) in enumerate(_litems):
+            _pct = (_val / _lmax) * 100
+            _color = _lpalette[_i % len(_lpalette)]
+            _lbars_html += f"""
+            <div style="margin-bottom:0.7rem;">
+                <div style="display:flex; justify-content:space-between; font-size:0.82rem; color:var(--os-text-dim); margin-bottom:0.28rem;">
+                    <span>{_label}</span><span style="color:#FFFFFF; font-weight:700;">{_val}</span>
+                </div>
+                <div style="background:rgba(255,255,255,0.07); border-radius:8px; height:11px; overflow:hidden;">
+                    <div style="width:{_pct}%; height:100%; background:linear-gradient(90deg,{_color},#818CF8);
+                                border-radius:8px; box-shadow:0 0 12px {_color}66;"></div>
+                </div>
+            </div>
+            """
+        st.markdown(f'<div>{_lbars_html}</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="os-card">', unsafe_allow_html=True)
@@ -798,6 +853,8 @@ with tab_faq:
         "self-serve help page. This is an autonomous action: one click scans "
         "the whole knowledge base and drafts the document for you."
     )
+    faq_lang_options = [l for l in SUPPORTED_LANGUAGES.keys() if l != "Auto-detect"]
+    faq_language = st.selectbox("FAQ language", faq_lang_options, index=0, key="faq_language")
     generate_clicked = st.button("⚡ Generate FAQ now", type="primary")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -807,7 +864,7 @@ with tab_faq:
             st.warning("No documents indexed in this space yet.")
         else:
             with st.spinner("Reading through the knowledge base and drafting an FAQ..."):
-                faq_md = generate_faq(vs, llm, active_space)
+                faq_md = generate_faq(vs, llm, active_space, language=faq_language)
             if faq_md:
                 st.markdown('<div class="os-card">', unsafe_allow_html=True)
                 st.markdown(faq_md)
