@@ -25,6 +25,15 @@ different from just asking ChatGPT?"):
 4. Automation actions (Auto-FAQ generation, escalation queue) turn the tool
    from "a place to ask questions" into something that does repetitive work
    for a team, matching the "AI Automation & Intelligent Agents" theme.
+
+5. Answer verification (verify_answer_facts + self_critique below) adds a
+   second, independent check on top of every generated answer: a plain
+   deterministic string-match pass for numbers/dates/quantities, plus one
+   bounded LLM re-check of the answer against its own context. This is a
+   modest, honest safety net — NOT causal reasoning, NOT autonomous
+   multi-step correction, and NOT a solved general research problem. It
+   catches a narrow, real class of grounding errors and says so plainly
+   when it can't verify something, rather than claiming more than it does.
 """
 
 import json
@@ -387,6 +396,99 @@ def _is_gap_response(raw: str) -> bool:
     return cleaned.startswith(NOT_FOUND_TOKEN) or (NOT_FOUND_TOKEN in cleaned and len(cleaned) < 40)
 
 
+# --------------------------------------------------------------------------
+# Answer verification: a symbolic (deterministic) pass + a bounded neural
+# (single LLM call) pass, run on top of every generated answer.
+#
+# What this IS: two independent, narrow checks that catch a real class of
+# grounding errors — a number the model invented, or a claim the answer
+# makes that its own retrieved context doesn't actually support.
+#
+# What this is NOT: causal/physical world modeling, autonomous multi-step
+# self-correction, or continuous learning. Both checks are heuristic and
+# bounded — one regex pass, one extra LLM call — and both fail open (they
+# flag a caveat to the user rather than silently rewriting the answer or
+# blocking it), because a heuristic verifier being wrong should never be
+# more disruptive than the thing it's checking.
+# --------------------------------------------------------------------------
+
+# Matches quantities likely to be load-bearing facts: currency, percentages,
+# numbers with a time/quantity unit, and bare numbers of 2+ digits (catches
+# years, counts, dollar figures without a symbol, etc). Deliberately skips
+# bare single digits, since those are usually list markers or prose ("one
+# of the two options") rather than facts worth cross-checking.
+_FACT_RE = re.compile(
+    r"""
+    \$\s?\d[\d,]*(?:\.\d+)?                                   # $75, $1,200.50
+    | \d[\d,]*(?:\.\d+)?\s?%                                  # 18%, 4.5%
+    | \d[\d,]*(?:\.\d+)?\s?(?:days?|months?|years?|hours?|minutes?|weeks?)  # 18 days, 6 months
+    | \b\d{2,}\b                                              # 2026, 500, 30
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _normalize_fact(raw: str) -> str:
+    s = raw.strip().lower().replace(",", "")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def verify_answer_facts(answer: str, source_docs: list) -> dict:
+    """Deterministic, non-LLM check: does every number/percentage/quantity
+    claim in the generated answer literally appear somewhere in the
+    retrieved source text? Pure string matching — no model call, so this
+    step cannot itself hallucinate.
+
+    Caveat (stated plainly, not hidden): this only catches exact-token
+    mismatches. If the model paraphrases "18 days" as "eighteen days" or
+    computes a derived figure, this heuristic won't recognize the match and
+    may over-flag. It's a supplementary signal on top of the grounded
+    prompt, not a substitute for it.
+    """
+    context_text = " ".join(d.page_content for d in source_docs)
+    context_facts = {_normalize_fact(m) for m in _FACT_RE.findall(context_text)}
+    answer_facts = {_normalize_fact(m) for m in _FACT_RE.findall(answer)}
+    verified = sorted(f for f in answer_facts if f in context_facts)
+    unverified = sorted(f for f in answer_facts if f not in context_facts)
+    return {"checked": bool(answer_facts), "verified": verified, "unverified": unverified}
+
+
+def self_critique(llm, answer: str, source_docs: list, max_context_chars: int = 6000) -> dict:
+    """One bounded verification pass: ask the model to check its own answer
+    against the retrieved context. This is a single extra call, not a loop
+    — it never re-plans, re-runs, or edits anything on its own. If the
+    check itself fails for any reason (rate limit, transient API error), we
+    fail open: the original answer still reaches the user, just without a
+    verification badge, rather than blocking on a check that couldn't run.
+    """
+    context_text = "\n\n".join(d.page_content for d in source_docs)[:max_context_chars]
+    prompt = (
+        "You are a strict fact-checker reviewing an AI-generated answer against "
+        "its source context. Check ONLY whether every factual claim in the "
+        "answer is directly supported by the context below — do not comment on "
+        "style, tone, completeness, or language.\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Answer to check:\n{answer}\n\n"
+        "If every claim in the answer is directly supported by the context, "
+        "reply with exactly one word: SUPPORTED\n"
+        "If any claim is not supported by the context, reply starting with "
+        "UNSUPPORTED: followed by a short comma-separated list of the specific "
+        "unsupported claims. Do not explain, do not add anything else."
+    )
+    try:
+        resp = call_with_retry(llm.invoke, prompt)
+        text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+    except Exception:
+        return {"checked": False, "passed": True, "issues": []}
+
+    if text.upper().startswith("SUPPORTED"):
+        return {"checked": True, "passed": True, "issues": []}
+    issues_str = text.split(":", 1)[1].strip() if ":" in text else text
+    issues = [i.strip() for i in issues_str.split(",") if i.strip()]
+    return {"checked": True, "passed": False, "issues": issues}
+
+
 def _build_prompt(persona: str, answer_lang_name: str) -> ChatPromptTemplate:
     persona_instruction = PERSONAS.get(persona, PERSONAS["General"])
     language_instruction = (
@@ -413,7 +515,8 @@ def _build_prompt(persona: str, answer_lang_name: str) -> ChatPromptTemplate:
 
 
 def answer_question(
-    vs, query: str, persona: str, llm, answer_language: str = "Auto-detect", k: int = 4
+    vs, query: str, persona: str, llm, answer_language: str = "Auto-detect",
+    k: int = 4, verify: bool = True,
 ) -> dict:
     lang_code, lang_name = resolve_answer_language(query, answer_language)
     localized_gap = GAP_MESSAGES.get(lang_code, GAP_MESSAGE)
@@ -436,10 +539,19 @@ def answer_question(
 
     sources = sorted({d.metadata.get("source", "Unknown") for d in docs})
     pages = sorted({(d.metadata.get("page", 0) or 0) + 1 for d in docs})
-    return {
+    result = {
         "answer": raw, "sources": sources, "pages": pages, "status": "answered",
         "language": lang_name, "language_code": lang_code,
     }
+
+    if verify:
+        result["fact_check"] = verify_answer_facts(raw, docs)
+        result["critique"] = self_critique(llm, raw, docs)
+    else:
+        result["fact_check"] = {"checked": False, "verified": [], "unverified": []}
+        result["critique"] = {"checked": False, "passed": True, "issues": []}
+
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -469,7 +581,8 @@ def read_jsonl(path: str) -> list:
 
 
 def log_interaction(
-    space: str, persona: str, query: str, status: str, sources: list, language: str = "English"
+    space: str, persona: str, query: str, status: str, sources: list,
+    language: str = "English", verification_flagged: bool = False,
 ):
     _append_jsonl(QUERY_LOG, {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -479,6 +592,7 @@ def log_interaction(
         "status": status,
         "sources": sources,
         "language": language,
+        "verification_flagged": verification_flagged,
     })
 
 
@@ -497,6 +611,7 @@ def get_analytics(space: str) -> dict:
     total = len(rows)
     answered = sum(1 for r in rows if r.get("status") == "answered")
     gaps = [r for r in rows if r.get("status") == "gap"]
+    flagged = sum(1 for r in rows if r.get("verification_flagged"))
     by_persona: dict = {}
     by_language: dict = {}
     for r in rows:
@@ -508,6 +623,7 @@ def get_analytics(space: str) -> dict:
         "total_queries": total,
         "answered": answered,
         "gap_count": len(gaps),
+        "verification_flagged": flagged,
         "resolution_rate": round(100 * answered / total, 1) if total else 0.0,
         "gaps": list(reversed(gaps))[:25],
         "by_persona": by_persona,
