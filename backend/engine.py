@@ -373,6 +373,14 @@ def load_url_docs(url: str):
     return [Document(page_content=_clean(text), metadata={"source": url, "page": 0})]
 
 
+EMBED_BATCH_SIZE = 50
+# Large PDFs (e.g. long handwritten-notes scans) can split into hundreds of
+# chunks. Embedding them all in a single call risks free-tier rate limits /
+# timeouts, and a failure partway through would force re-embedding
+# everything from scratch. Embedding in small batches — and merging into the
+# index as each batch succeeds — fixes both problems.
+
+
 def ingest_documents(space: str, raw_docs: list, embeddings) -> int:
     """Splits raw_docs into chunks and merges them into the space's index.
     Returns the number of chunks added (0 if there was no extractable text —
@@ -380,15 +388,23 @@ def ingest_documents(space: str, raw_docs: list, embeddings) -> int:
     chunks = SPLITTER.split_documents(raw_docs)
     if not chunks:
         return 0
-    new_vs = call_with_retry(FAISS.from_documents, chunks, embeddings)
-    existing = load_vector_store(space, embeddings)
-    if existing is not None:
-        existing.merge_from(new_vs)
-        save_vector_store(space, existing)
-    else:
-        save_vector_store(space, new_vs)
-    return len(chunks)
 
+    combined_vs = load_vector_store(space, embeddings)
+
+    for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+        batch = chunks[i:i + EMBED_BATCH_SIZE]
+        batch_vs = call_with_retry(FAISS.from_documents, batch, embeddings)
+        if combined_vs is None:
+            combined_vs = batch_vs
+        else:
+            combined_vs.merge_from(batch_vs)
+        # brief pause between batches so large PDFs don't burst past the
+        # free-tier requests-per-minute limit
+        if i + EMBED_BATCH_SIZE < len(chunks):
+            time.sleep(1)
+
+    save_vector_store(space, combined_vs)
+    return len(chunks)
 
 # --------------------------------------------------------------------------
 # Grounded retrieval + answering
