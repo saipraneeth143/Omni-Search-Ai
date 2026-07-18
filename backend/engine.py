@@ -82,7 +82,7 @@ ESCALATION_LOG = os.path.join(LOG_DIR, "escalations.jsonl")
 # Kept identical to the model already validated & deployed in production —
 # do not change without re-testing the deployment.
 EMBEDDING_MODEL = "gemini-embedding-2-preview"
-LLM_MODEL = "gemini-1.5-flash"
+LLM_MODEL = "gemini-3.1-flash"
 
 NOT_FOUND_TOKEN = "NOT_IN_KB"
 GAP_MESSAGE = (
