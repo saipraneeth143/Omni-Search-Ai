@@ -5,7 +5,6 @@ import streamlit as st
 
 from engine import (
     PERSONAS,
-    SUPPORTED_LANGUAGES,
     _slug,
     generate_faq,
     get_analytics,
@@ -66,6 +65,65 @@ The company matches 401(k) contributions up to 4% of salary. Employees also
 receive an annual $500 wellness stipend that can be used for gym memberships,
 fitness equipment, or mental health apps.
 """
+
+# ============================================================================
+# MULTI-LANGUAGE SUPPORT
+#
+# Design decision: retrieval stays English-only against the source documents
+# (the vector index was built on the original document text, so embedding a
+# language instruction into the search query would degrade match quality).
+# Instead, we ground the answer exactly as before, then run a single,
+# fact-preserving translation pass over the finished text. Grounding and
+# language are fully decoupled — translation failures fall back to the
+# English answer rather than breaking the chat.
+# ============================================================================
+LANGUAGES = [
+    "English", "Hindi", "Telugu", "Tamil", "Spanish", "French",
+    "German", "Arabic", "Chinese (Simplified)", "Japanese",
+    "Portuguese", "Russian",
+]
+
+
+def translate_text(text: str, target_language: str, llm) -> str:
+    """Translate an already-grounded answer into the target language.
+    Never raises — on any failure, returns the original text unchanged
+    so a translation hiccup can never break the chat response."""
+    if not text or not text.strip() or target_language == "English":
+        return text
+    prompt = (
+        f"Translate the following text into {target_language}. "
+        "Preserve all facts, numbers, names, and markdown formatting exactly. "
+        "Do not add, remove, or explain anything — output ONLY the translated "
+        f"text.\n\nText:\n{text}"
+    )
+    try:
+        response = llm.invoke(prompt)
+        translated = getattr(response, "content", None)
+        if translated is None:
+            translated = str(response)
+        translated = translated.strip()
+        return translated if translated else text
+    except Exception:
+        return text
+
+
+def get_retrieved_evidence(vs, query: str, k: int = 4):
+    """Best-effort fetch of the raw passages behind an answer, for the
+    transparency panel. Never raises — returns [] if unsupported, so a
+    missing vector-store method can never break the chat response.
+    Returns a list of (text, metadata, score_or_None)."""
+    if vs is None:
+        return []
+    try:
+        if hasattr(vs, "similarity_search_with_score"):
+            results = vs.similarity_search_with_score(query, k=k)
+            return [(doc.page_content, doc.metadata, score) for doc, score in results]
+        if hasattr(vs, "similarity_search"):
+            docs = vs.similarity_search(query, k=k)
+            return [(doc.page_content, doc.metadata, None) for doc in docs]
+    except Exception:
+        pass
+    return []
 
 st.set_page_config(
     page_title="OmniSearch AI",
@@ -550,40 +608,12 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 🌐 Answer Language")
-    answer_language = st.selectbox(
-        "Reply in",
-        list(SUPPORTED_LANGUAGES.keys()),
-        index=0,
-        key="answer_language",
-        help=(
-            "Auto-detect replies in whatever language you type your question in. "
-            "Pick a specific language to always get answers in that language, "
-            "even if your documents are in a different one."
-        ),
+    answer_language = st.selectbox("Respond in", LANGUAGES, index=0, key="answer_language")
+    st.caption(
+        "Search stays grounded in your source documents in their original "
+        "language — only the final answer is translated, so accuracy doesn't "
+        "get diluted by the language choice."
     )
-    if answer_language == "Auto-detect":
-        st.caption("I'll match the language of each question you ask.")
-    else:
-        st.caption(f"All answers in this space will be written in {answer_language}.")
-
-    st.divider()
-    st.markdown("### 🔎 Answer Verification")
-    verify_answers = st.checkbox(
-        "Double-check answers before showing them",
-        value=True,
-        key="verify_answers",
-        help=(
-            "Runs two extra checks on every answer: a plain string match "
-            "confirming any numbers/dates it cites actually appear in the "
-            "source documents, plus one additional AI pass re-checking the "
-            "answer against its own context. Adds a little latency and one "
-            "extra API call per question — turn off to save both."
-        ),
-    )
-    if verify_answers:
-        st.caption("Flags unsupported figures or claims instead of hiding them.")
-    else:
-        st.caption("Off — answers are shown without the extra verification pass.")
 
     st.divider()
     st.markdown("### 📥 Add Knowledge")
@@ -686,17 +716,35 @@ with tab_chat:
     vs = load_vector_store(active_space, embeddings)
     history_key = f"messages::{active_space}"
     if history_key not in st.session_state:
+        welcome = (
+            f"Ask me anything about the documents in **{active_space}**. "
+            f"I'll only answer from what's been indexed here, in {persona} mode."
+        )
+        welcome = translate_text(welcome, answer_language, llm)
         st.session_state[history_key] = [{
             "role": "assistant",
-            "content": (
-                f"Ask me anything about the documents in **{active_space}**. "
-                f"I'll only answer from what's been indexed here, in {persona} mode."
-            ),
+            "content": welcome,
+            "language": answer_language,
         }]
 
-    for m in st.session_state[history_key]:
+    def _render_evidence(evidence, key_suffix):
+        with st.expander(f"🔍 Show retrieved evidence ({len(evidence)} passages)"):
+            for i, (text, meta, score) in enumerate(evidence, start=1):
+                meta = meta if isinstance(meta, dict) else {}
+                src = meta.get("source") or meta.get("name") or "Unknown source"
+                page = meta.get("page", meta.get("page_number", "-"))
+                score_str = f" · relevance {score:.2f}" if isinstance(score, (int, float)) else ""
+                st.markdown(f"**[{i}] {src}** (page {page}){score_str}")
+                snippet = text[:400] + ("..." if len(text) > 400 else "")
+                st.caption(snippet)
+
+    for _mi, m in enumerate(st.session_state[history_key]):
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
+            if m.get("language") and m["language"] != "English":
+                st.caption(f"🌐 Translated to {m['language']}")
+            if m.get("evidence"):
+                _render_evidence(m["evidence"], key_suffix=_mi)
 
     if prompt := st.chat_input("Ask a question about this knowledge space..."):
         st.session_state[history_key].append({"role": "user", "content": prompt})
@@ -706,61 +754,47 @@ with tab_chat:
         with st.chat_message("assistant"):
             if vs is None:
                 msg = "This knowledge space doesn't have any documents indexed yet — add some in the sidebar first."
+                msg = translate_text(msg, answer_language, llm)
                 st.markdown(msg)
-                st.session_state[history_key].append({"role": "assistant", "content": msg})
+                st.session_state[history_key].append({
+                    "role": "assistant", "content": msg, "language": answer_language,
+                })
             else:
                 with st.spinner("Searching the knowledge base..."):
-                    result = answer_question(
-                        vs, prompt, persona, llm,
-                        answer_language=answer_language, verify=verify_answers,
-                    )
-
-                unverified = result["fact_check"].get("unverified", [])
-                critique = result["critique"]
-                critique_issues = critique.get("issues", []) if not critique.get("passed", True) else []
-                verification_flagged = bool(unverified or critique_issues)
-
-                log_interaction(
-                    active_space, persona, prompt, result["status"], result["sources"],
-                    language=result["language"], verification_flagged=verification_flagged,
-                )
-
-                lang_note = (
-                    f"🌐 Auto-detected: replied in {result['language']}."
-                    if answer_language == "Auto-detect"
-                    else f"🌐 Replied in {result['language']}."
-                )
-
-                verification_note = ""
-                if result["status"] == "answered" and verify_answers:
-                    if verification_flagged:
-                        parts = []
-                        if unverified:
-                            parts.append(f"figures not found verbatim in the source text: {', '.join(unverified)}")
-                        if critique_issues:
-                            parts.append(f"claims the self-check couldn't confirm: {', '.join(critique_issues)}")
-                        verification_note = (
-                            "\n\n⚠️ **Verification flags** — " + "; ".join(parts) +
-                            ". Worth double-checking before relying on this."
-                        )
-                    elif result["fact_check"].get("checked") or critique.get("checked"):
-                        verification_note = "\n\n✅ Verified: figures and claims traced to the source documents above."
+                    result = answer_question(vs, prompt, persona, llm)
+                log_interaction(active_space, persona, prompt, result["status"], result["sources"])
 
                 if result["status"] == "gap":
-                    st.warning(result["answer"])
-                    st.caption(lang_note)
+                    gap_text = translate_text(result["answer"], answer_language, llm)
+                    st.warning(gap_text)
+                    if answer_language != "English":
+                        st.caption(f"🌐 Translated to {answer_language}")
                     flag_key = f"flag_{active_space}_{len(st.session_state[history_key])}"
                     if st.button("🚩 Flag this for a human expert", key=flag_key):
                         log_escalation(active_space, persona, prompt)
                         st.success("Flagged — an admin will see this in the Analytics tab.")
-                    st.session_state[history_key].append({"role": "assistant", "content": result["answer"]})
+                    st.session_state[history_key].append({
+                        "role": "assistant", "content": gap_text, "language": answer_language,
+                    })
                 else:
+                    translated_answer = translate_text(result["answer"], answer_language, llm)
                     pages_str = ", ".join(str(p) for p in result["pages"])
                     sources_str = ", ".join(result["sources"])
-                    full = f"{result['answer']}\n\n**Sources:** {sources_str} (pages {pages_str}){verification_note}"
+                    full = f"{translated_answer}\n\n**Sources:** {sources_str} (pages {pages_str})"
                     st.markdown(full)
-                    st.caption(f"✅ Answered from the knowledge base above. {lang_note}")
-                    st.session_state[history_key].append({"role": "assistant", "content": full})
+                    if answer_language != "English":
+                        st.caption(f"🌐 Translated to {answer_language} · grounded in the original-language source documents")
+                    else:
+                        st.caption("✅ Answered from the knowledge base above.")
+
+                    evidence = get_retrieved_evidence(vs, prompt, k=4)
+                    if evidence:
+                        _render_evidence(evidence, key_suffix="live")
+
+                    st.session_state[history_key].append({
+                        "role": "assistant", "content": full,
+                        "language": answer_language, "evidence": evidence,
+                    })
 
 # ------------------------------ Analytics ----------------------------------
 with tab_analytics:
@@ -771,9 +805,8 @@ with tab_analytics:
         ("✅", "Answered", stats["answered"], "#10B981"),
         ("🕳️", "Knowledge gaps", stats["gap_count"], "#F59E0B"),
         ("📈", "Resolution rate", f"{stats['resolution_rate']}%", "#22D3EE"),
-        ("🔍", "Verification flags", stats.get("verification_flagged", 0), "#F472B6"),
     ]
-    cols = st.columns(5)
+    cols = st.columns(4)
     for col, (icon, label, value, color) in zip(cols, kpi_defs):
         col.markdown(
             f"""
@@ -811,32 +844,6 @@ with tab_analytics:
             </div>
             """
         st.markdown(f'<div>{_bars_html}</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    if stats.get("by_language"):
-        st.markdown('<div class="os-card">', unsafe_allow_html=True)
-        st.markdown('<div class="os-section-title">🌐 Queries by language</div>', unsafe_allow_html=True)
-        st.caption("Which languages people are actually asking questions in — useful for spotting where to prioritize document translation.")
-        _lang_data = stats["by_language"]
-        _litems = list(_lang_data.items())
-        _lmax = max((v for _, v in _litems), default=0) or 1
-        _lpalette = ["#22D3EE", "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#A78BFA", "#F87171"]
-        _lbars_html = ""
-        for _i, (_label, _val) in enumerate(_litems):
-            _pct = (_val / _lmax) * 100
-            _color = _lpalette[_i % len(_lpalette)]
-            _lbars_html += f"""
-            <div style="margin-bottom:0.7rem;">
-                <div style="display:flex; justify-content:space-between; font-size:0.82rem; color:var(--os-text-dim); margin-bottom:0.28rem;">
-                    <span>{_label}</span><span style="color:#FFFFFF; font-weight:700;">{_val}</span>
-                </div>
-                <div style="background:rgba(255,255,255,0.07); border-radius:8px; height:11px; overflow:hidden;">
-                    <div style="width:{_pct}%; height:100%; background:linear-gradient(90deg,{_color},#818CF8);
-                                border-radius:8px; box-shadow:0 0 12px {_color}66;"></div>
-                </div>
-            </div>
-            """
-        st.markdown(f'<div>{_lbars_html}</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="os-card">', unsafe_allow_html=True)
@@ -897,8 +904,6 @@ with tab_faq:
         "self-serve help page. This is an autonomous action: one click scans "
         "the whole knowledge base and drafts the document for you."
     )
-    faq_lang_options = [l for l in SUPPORTED_LANGUAGES.keys() if l != "Auto-detect"]
-    faq_language = st.selectbox("FAQ language", faq_lang_options, index=0, key="faq_language")
     generate_clicked = st.button("⚡ Generate FAQ now", type="primary")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -908,7 +913,7 @@ with tab_faq:
             st.warning("No documents indexed in this space yet.")
         else:
             with st.spinner("Reading through the knowledge base and drafting an FAQ..."):
-                faq_md = generate_faq(vs, llm, active_space, language=faq_language)
+                faq_md = generate_faq(vs, llm, active_space)
             if faq_md:
                 st.markdown('<div class="os-card">', unsafe_allow_html=True)
                 st.markdown(faq_md)
