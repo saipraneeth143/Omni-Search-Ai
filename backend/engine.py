@@ -79,9 +79,12 @@ LOG_DIR = "logs"
 QUERY_LOG = os.path.join(LOG_DIR, "query_log.jsonl")
 ESCALATION_LOG = os.path.join(LOG_DIR, "escalations.jsonl")
 
-# Kept identical to the model already validated & deployed in production —
-# do not change without re-testing the deployment.
 EMBEDDING_MODEL = "gemini-embedding-2-preview"
+# NOTE: gemini-2.5-flash began returning early 404s for many accounts in
+# July 2026 (ahead of its official Oct 16 2026 deprecation date — a known,
+# widely-reported Google-side rollout issue). Pinned to the "-latest" alias
+# instead of a specific dated model so this doesn't silently 404 again the
+# next time Google retires a specific version.
 LLM_MODEL = "gemini-flash-latest"
 
 NOT_FOUND_TOKEN = "NOT_IN_KB"
