@@ -747,7 +747,7 @@ with tab_chat:
             else:
                 with st.spinner("Searching the knowledge base..."):
                     try:
-                        result = answer_question(vs, prompt, persona, llm, answer_language=answer_language)
+                        result = answer_question(vs, prompt, persona, llm, answer_language=answer_language, verify=False)
                     except Exception as e:
                         result = None
                         err_msg = (
