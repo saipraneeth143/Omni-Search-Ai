@@ -940,6 +940,20 @@ with tab_faq:
                     )
                     with st.expander("Technical details (for debugging)"):
                         st.code(f"{type(e).__name__}: {e}")
+            if faq_md is not None and not isinstance(faq_md, str):
+                # Gemini's response.content can come back as a list of
+                # content-part dicts instead of a plain string depending on
+                # the response shape. st.markdown tolerates that loosely;
+                # st.download_button does not, so normalize here rather
+                # than trusting the return type.
+                if isinstance(faq_md, list):
+                    faq_md = "\n".join(
+                        part.get("text", "") if isinstance(part, dict) else str(part)
+                        for part in faq_md
+                    ).strip()
+                else:
+                    faq_md = str(faq_md)
+
             if faq_md:
                 st.markdown('<div class="os-card">', unsafe_allow_html=True)
                 st.markdown(faq_md)
