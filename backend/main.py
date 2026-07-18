@@ -472,11 +472,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# --- CRITICAL FIX (kept): read the API key from Streamlit secrets ---
-if "GOOGLE_API_KEY" in st.secrets:
-    os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+# --- Read the Groq API key from Streamlit secrets ---
+# Embeddings need no key at all (they run locally); only the chat model
+# (Groq) needs one. Get a free key at https://console.groq.com/keys
+if "GROQ_API_KEY" in st.secrets:
+    os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
 else:
-    st.error("Please add your GOOGLE_API_KEY to Streamlit secrets.")
+    st.error(
+        "Please add your GROQ_API_KEY to Streamlit secrets "
+        "(Settings → Secrets, in your Streamlit Cloud app dashboard)."
+    )
     st.stop()
 
 embeddings = get_embeddings()
@@ -753,7 +758,7 @@ with tab_chat:
                         err_msg = (
                             "⚠️ The AI service hit an error while generating this answer. "
                             "This is almost always a temporary **rate limit or quota** issue "
-                            "on the free Gemini API tier (too many requests in a short window) "
+                            "on the free Groq API tier (too many requests in a short window) "
                             "— wait about a minute and try again."
                         )
                         st.error(err_msg)
@@ -936,12 +941,12 @@ with tab_faq:
                     st.error(
                         "⚠️ The AI service hit an error while generating the FAQ. "
                         "This is almost always a temporary rate limit or quota issue "
-                        "on the free Gemini API tier — wait about a minute and try again."
+                        "on the free Groq API tier — wait about a minute and try again."
                     )
                     with st.expander("Technical details (for debugging)"):
                         st.code(f"{type(e).__name__}: {e}")
             if faq_md is not None and not isinstance(faq_md, str):
-                # Gemini's response.content can come back as a list of
+                # response.content can sometimes come back as a list of
                 # content-part dicts instead of a plain string depending on
                 # the response shape. st.markdown tolerates that loosely;
                 # st.download_button does not, so normalize here rather
