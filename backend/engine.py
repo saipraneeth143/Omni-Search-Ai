@@ -46,15 +46,11 @@ from datetime import datetime, timezone
 import streamlit as st
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import (
-    ChatGoogleGenerativeAI,
-    GoogleGenerativeAIEmbeddings,
-    HarmBlockThreshold,
-    HarmCategory,
-)
+from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 try:
@@ -79,13 +75,19 @@ LOG_DIR = "logs"
 QUERY_LOG = os.path.join(LOG_DIR, "query_log.jsonl")
 ESCALATION_LOG = os.path.join(LOG_DIR, "escalations.jsonl")
 
-EMBEDDING_MODEL = "gemini-embedding-2-preview"
-# NOTE: gemini-2.5-flash began returning early 404s for many accounts in
-# July 2026 (ahead of its official Oct 16 2026 deprecation date — a known,
-# widely-reported Google-side rollout issue). Pinned to the "-latest" alias
-# instead of a specific dated model so this doesn't silently 404 again the
-# next time Google retires a specific version.
-LLM_MODEL = "gemini-2.0-flash"
+# Embeddings now run locally (sentence-transformers), not via an API — free,
+# unlimited, and removes one whole rate-limited dependency from ingestion.
+# NOTE: this has a different vector dimensionality than the old Gemini
+# embeddings, so any FAISS index under kb_store/ built before this switch is
+# NOT compatible and must be rebuilt (delete the space or re-upload its
+# documents) — see the migration note in the README/PR description.
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# Groq's free tier: fast inference, generous free rate limits, no credit
+# card required. gpt-oss-120b is Groq's current recommended replacement for
+# the retired llama-3.3-70b-versatile (deprecated on the free tier June 17,
+# 2026) — check https://console.groq.com/docs/models for the current list
+# if this model is ever retired too.
+LLM_MODEL = "openai/gpt-oss-120b"
 
 NOT_FOUND_TOKEN = "NOT_IN_KB"
 GAP_MESSAGE = (
@@ -93,13 +95,6 @@ GAP_MESSAGE = (
     "been added yet, or the documents that cover it haven't been uploaded "
     "to this space."
 )
-
-SAFETY_SETTINGS = {
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-}
 
 PERSONAS = {
     "General": "You are a helpful, precise knowledge assistant.",
@@ -147,8 +142,9 @@ PERSONAS = {
 # Display name -> ISO 639-1 code (what langdetect returns) shown in the UI
 # dropdown. "Auto-detect" (None) means: infer the language from the user's
 # question itself, so a Hindi question gets a Hindi answer even if every
-# indexed document is in English — Gemini's embeddings are cross-lingual,
-# so retrieval still works, only the final generation step needs steering.
+# indexed document is in English — the multilingual embedding model is
+# cross-lingual, so retrieval still works, only the final generation step
+# needs steering.
 SUPPORTED_LANGUAGES = {
     "Auto-detect": None,
     "English": "en",
@@ -245,12 +241,12 @@ def _slug(name: str) -> str:
 
 
 def _clean(text: str) -> str:
-    # Same critical fix as before: null bytes crash the Gemini API.
+    # Null bytes crash both the embedding step and most LLM APIs; strip them.
     return text.replace("\x00", "")
 
 
 def call_with_retry(fn, *args, max_retries=4, base_delay=2, **kwargs):
-    """Exponential backoff for Gemini rate-limit (429) errors."""
+    """Exponential backoff for LLM API rate-limit (429) errors."""
     last_err = None
     for attempt in range(max_retries):
         try:
@@ -268,12 +264,19 @@ def call_with_retry(fn, *args, max_retries=4, base_delay=2, **kwargs):
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings():
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    # Runs in-process on CPU — no API key, no network call, no rate limit.
+    # First call downloads the model (~90MB) and caches it on disk; every
+    # call after that is instant.
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
 @st.cache_resource(show_spinner=False)
 def get_llm():
-    return ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.0, safety_settings=SAFETY_SETTINGS)
+    return ChatGroq(model=LLM_MODEL, temperature=0.0)
 
 
 # --------------------------------------------------------------------------
@@ -375,10 +378,10 @@ def load_url_docs(url: str):
 
 EMBED_BATCH_SIZE = 50
 # Large PDFs (e.g. long handwritten-notes scans) can split into hundreds of
-# chunks. Embedding them all in a single call risks free-tier rate limits /
-# timeouts, and a failure partway through would force re-embedding
-# everything from scratch. Embedding in small batches — and merging into the
-# index as each batch succeeds — fixes both problems.
+# chunks. Embedding runs locally now (no API/rate limit), but batching is
+# still kept: it bounds peak memory on small Streamlit Cloud instances and
+# means a crash partway through doesn't force re-embedding everything from
+# scratch, since each batch is merged into the index as it completes.
 
 
 def ingest_documents(space: str, raw_docs: list, embeddings) -> int:
@@ -393,15 +396,11 @@ def ingest_documents(space: str, raw_docs: list, embeddings) -> int:
 
     for i in range(0, len(chunks), EMBED_BATCH_SIZE):
         batch = chunks[i:i + EMBED_BATCH_SIZE]
-        batch_vs = call_with_retry(FAISS.from_documents, batch, embeddings)
+        batch_vs = FAISS.from_documents(batch, embeddings)
         if combined_vs is None:
             combined_vs = batch_vs
         else:
             combined_vs.merge_from(batch_vs)
-        # brief pause between batches so large PDFs don't burst past the
-        # free-tier requests-per-minute limit
-        if i + EMBED_BATCH_SIZE < len(chunks):
-            time.sleep(1)
 
     save_vector_store(space, combined_vs)
     return len(chunks)
