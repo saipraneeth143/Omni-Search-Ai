@@ -85,7 +85,7 @@ EMBEDDING_MODEL = "gemini-embedding-2-preview"
 # widely-reported Google-side rollout issue). Pinned to the "-latest" alias
 # instead of a specific dated model so this doesn't silently 404 again the
 # next time Google retires a specific version.
-LLM_MODEL = "gemini-flash-latest"
+LLM_MODEL = "gemini-2.5-flash"
 
 NOT_FOUND_TOKEN = "NOT_IN_KB"
 GAP_MESSAGE = (
