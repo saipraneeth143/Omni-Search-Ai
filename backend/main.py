@@ -5,6 +5,7 @@ import streamlit as st
 
 from engine import (
     PERSONAS,
+    SUPPORTED_LANGUAGES,
     _slug,
     generate_faq,
     get_analytics,
@@ -69,42 +70,13 @@ fitness equipment, or mental health apps.
 # ============================================================================
 # MULTI-LANGUAGE SUPPORT
 #
-# Design decision: retrieval stays English-only against the source documents
-# (the vector index was built on the original document text, so embedding a
-# language instruction into the search query would degrade match quality).
-# Instead, we ground the answer exactly as before, then run a single,
-# fact-preserving translation pass over the finished text. Grounding and
-# language are fully decoupled — translation failures fall back to the
-# English answer rather than breaking the chat.
+# engine.py already implements this properly: SUPPORTED_LANGUAGES (imported
+# above), auto-detection of the question's language, and localized answers
+# generated in a single grounded LLM call (retrieval stays anchored to the
+# original document language/embeddings; only the generation step is
+# steered to the target language) — so no separate translation pass is
+# needed here.
 # ============================================================================
-LANGUAGES = [
-    "English", "Hindi", "Telugu", "Tamil", "Spanish", "French",
-    "German", "Arabic", "Chinese (Simplified)", "Japanese",
-    "Portuguese", "Russian",
-]
-
-
-def translate_text(text: str, target_language: str, llm) -> str:
-    """Translate an already-grounded answer into the target language.
-    Never raises — on any failure, returns the original text unchanged
-    so a translation hiccup can never break the chat response."""
-    if not text or not text.strip() or target_language == "English":
-        return text
-    prompt = (
-        f"Translate the following text into {target_language}. "
-        "Preserve all facts, numbers, names, and markdown formatting exactly. "
-        "Do not add, remove, or explain anything — output ONLY the translated "
-        f"text.\n\nText:\n{text}"
-    )
-    try:
-        response = llm.invoke(prompt)
-        translated = getattr(response, "content", None)
-        if translated is None:
-            translated = str(response)
-        translated = translated.strip()
-        return translated if translated else text
-    except Exception:
-        return text
 
 
 def get_retrieved_evidence(vs, query: str, k: int = 4):
@@ -608,11 +580,14 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 🌐 Answer Language")
-    answer_language = st.selectbox("Respond in", LANGUAGES, index=0, key="answer_language")
+    answer_language = st.selectbox(
+        "Respond in", list(SUPPORTED_LANGUAGES.keys()), index=0, key="answer_language"
+    )
     st.caption(
-        "Search stays grounded in your source documents in their original "
-        "language — only the final answer is translated, so accuracy doesn't "
-        "get diluted by the language choice."
+        "Auto-detect answers in whatever language the question was asked in. "
+        "Retrieval always stays grounded in the original source documents — "
+        "only the generated answer changes language, so accuracy doesn't get "
+        "diluted by the language choice."
     )
 
     st.divider()
@@ -717,17 +692,13 @@ with tab_chat:
     history_key = f"messages::{active_space}"
     if history_key not in st.session_state:
         welcome = (
-            f"Ask me anything about the documents in **{active_space}**. "
-            f"I'll only answer from what's been indexed here, in {persona} mode."
+            f"Ask me anything about the documents in **{active_space}**, in "
+            f"any language — I'll answer in whichever language you ask in "
+            f"(or the language you've pinned in the sidebar), in {persona} mode."
         )
-        welcome = translate_text(welcome, answer_language, llm)
-        st.session_state[history_key] = [{
-            "role": "assistant",
-            "content": welcome,
-            "language": answer_language,
-        }]
+        st.session_state[history_key] = [{"role": "assistant", "content": welcome}]
 
-    def _render_evidence(evidence, key_suffix):
+    def _render_evidence(evidence):
         with st.expander(f"🔍 Show retrieved evidence ({len(evidence)} passages)"):
             for i, (text, meta, score) in enumerate(evidence, start=1):
                 meta = meta if isinstance(meta, dict) else {}
@@ -738,13 +709,30 @@ with tab_chat:
                 snippet = text[:400] + ("..." if len(text) > 400 else "")
                 st.caption(snippet)
 
-    for _mi, m in enumerate(st.session_state[history_key]):
+    def _render_verification(fact_check, critique):
+        unverified = (fact_check or {}).get("unverified", [])
+        issues = (critique or {}).get("issues", [])
+        flagged = bool(unverified) or ((critique or {}).get("checked") and not critique.get("passed", True))
+        if flagged:
+            st.caption("⚠️ Verification flagged — some claims couldn't be fully confirmed against the source text.")
+            with st.expander("🧪 Verification details"):
+                if unverified:
+                    st.markdown("**Unconfirmed figures/quantities:** " + ", ".join(unverified))
+                if issues:
+                    st.markdown("**Fact-check notes:** " + "; ".join(issues))
+        else:
+            st.caption("✅ Verified against source documents (fact-check + self-critique pass).")
+        return flagged
+
+    for m in st.session_state[history_key]:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
             if m.get("language") and m["language"] != "English":
-                st.caption(f"🌐 Translated to {m['language']}")
+                st.caption(f"🌐 Answered in {m['language']}")
+            if "fact_check" in m:
+                _render_verification(m.get("fact_check"), m.get("critique"))
             if m.get("evidence"):
-                _render_evidence(m["evidence"], key_suffix=_mi)
+                _render_evidence(m["evidence"])
 
     if prompt := st.chat_input("Ask a question about this knowledge space..."):
         st.session_state[history_key].append({"role": "user", "content": prompt})
@@ -754,47 +742,66 @@ with tab_chat:
         with st.chat_message("assistant"):
             if vs is None:
                 msg = "This knowledge space doesn't have any documents indexed yet — add some in the sidebar first."
-                msg = translate_text(msg, answer_language, llm)
                 st.markdown(msg)
-                st.session_state[history_key].append({
-                    "role": "assistant", "content": msg, "language": answer_language,
-                })
+                st.session_state[history_key].append({"role": "assistant", "content": msg})
             else:
                 with st.spinner("Searching the knowledge base..."):
-                    result = answer_question(vs, prompt, persona, llm)
-                log_interaction(active_space, persona, prompt, result["status"], result["sources"])
+                    try:
+                        result = answer_question(vs, prompt, persona, llm, answer_language=answer_language)
+                    except Exception as e:
+                        result = None
+                        err_msg = (
+                            "⚠️ The AI service hit an error while generating this answer. "
+                            "This is almost always a temporary **rate limit or quota** issue "
+                            "on the free Gemini API tier (too many requests in a short window) "
+                            "— wait about a minute and try again."
+                        )
+                        st.error(err_msg)
+                        with st.expander("Technical details (for debugging)"):
+                            st.code(f"{type(e).__name__}: {e}")
+                        st.session_state[history_key].append({"role": "assistant", "content": err_msg})
 
-                if result["status"] == "gap":
-                    gap_text = translate_text(result["answer"], answer_language, llm)
-                    st.warning(gap_text)
-                    if answer_language != "English":
-                        st.caption(f"🌐 Translated to {answer_language}")
-                    flag_key = f"flag_{active_space}_{len(st.session_state[history_key])}"
-                    if st.button("🚩 Flag this for a human expert", key=flag_key):
-                        log_escalation(active_space, persona, prompt)
-                        st.success("Flagged — an admin will see this in the Analytics tab.")
-                    st.session_state[history_key].append({
-                        "role": "assistant", "content": gap_text, "language": answer_language,
-                    })
-                else:
-                    translated_answer = translate_text(result["answer"], answer_language, llm)
-                    pages_str = ", ".join(str(p) for p in result["pages"])
-                    sources_str = ", ".join(result["sources"])
-                    full = f"{translated_answer}\n\n**Sources:** {sources_str} (pages {pages_str})"
-                    st.markdown(full)
-                    if answer_language != "English":
-                        st.caption(f"🌐 Translated to {answer_language} · grounded in the original-language source documents")
+                if result is not None:
+                    fact_check = result.get("fact_check", {})
+                    critique = result.get("critique", {})
+                    verification_flagged = bool(fact_check.get("unverified")) or (
+                        critique.get("checked") and not critique.get("passed", True)
+                    )
+                    log_interaction(
+                        active_space, persona, prompt, result["status"], result["sources"],
+                        language=result.get("language", "English"),
+                        verification_flagged=verification_flagged if result["status"] == "answered" else False,
+                    )
+
+                    if result["status"] == "gap":
+                        st.warning(result["answer"])
+                        if result.get("language") and result["language"] != "English":
+                            st.caption(f"🌐 Answered in {result['language']}")
+                        flag_key = f"flag_{active_space}_{len(st.session_state[history_key])}"
+                        if st.button("🚩 Flag this for a human expert", key=flag_key):
+                            log_escalation(active_space, persona, prompt)
+                            st.success("Flagged — an admin will see this in the Analytics tab.")
+                        st.session_state[history_key].append({
+                            "role": "assistant", "content": result["answer"],
+                            "language": result.get("language"),
+                        })
                     else:
-                        st.caption("✅ Answered from the knowledge base above.")
+                        pages_str = ", ".join(str(p) for p in result["pages"])
+                        sources_str = ", ".join(result["sources"])
+                        full = f"{result['answer']}\n\n**Sources:** {sources_str} (pages {pages_str})"
+                        st.markdown(full)
+                        if result.get("language") and result["language"] != "English":
+                            st.caption(f"🌐 Answered in {result['language']} · grounded in the original source documents")
+                        _render_verification(fact_check, critique)
 
-                    evidence = get_retrieved_evidence(vs, prompt, k=4)
-                    if evidence:
-                        _render_evidence(evidence, key_suffix="live")
+                        evidence = get_retrieved_evidence(vs, prompt, k=4)
+                        if evidence:
+                            _render_evidence(evidence)
 
-                    st.session_state[history_key].append({
-                        "role": "assistant", "content": full,
-                        "language": answer_language, "evidence": evidence,
-                    })
+                        st.session_state[history_key].append({
+                            "role": "assistant", "content": full, "language": result.get("language"),
+                            "fact_check": fact_check, "critique": critique, "evidence": evidence,
+                        })
 
 # ------------------------------ Analytics ----------------------------------
 with tab_analytics:
@@ -805,8 +812,9 @@ with tab_analytics:
         ("✅", "Answered", stats["answered"], "#10B981"),
         ("🕳️", "Knowledge gaps", stats["gap_count"], "#F59E0B"),
         ("📈", "Resolution rate", f"{stats['resolution_rate']}%", "#22D3EE"),
+        ("🧪", "Verification flagged", stats.get("verification_flagged", 0), "#F472B6"),
     ]
-    cols = st.columns(4)
+    cols = st.columns(5)
     for col, (icon, label, value, color) in zip(cols, kpi_defs):
         col.markdown(
             f"""
@@ -821,30 +829,38 @@ with tab_analytics:
 
     st.write("")
 
-    if stats["by_persona"]:
+    def _render_bar_chart(title, data):
         st.markdown('<div class="os-card">', unsafe_allow_html=True)
-        st.markdown('<div class="os-section-title">📊 Queries by mode</div>', unsafe_allow_html=True)
-        _persona_data = stats["by_persona"]
-        _items = list(_persona_data.items()) if hasattr(_persona_data, "items") else list(enumerate(_persona_data))
-        _max_val = max((v for _, v in _items), default=0) or 1
-        _palette = ["#6366F1", "#22D3EE", "#34D399", "#FBBF24", "#F472B6", "#A78BFA"]
-        _bars_html = ""
-        for _i, (_label, _val) in enumerate(_items):
-            _pct = (_val / _max_val) * 100
-            _color = _palette[_i % len(_palette)]
-            _bars_html += f"""
+        st.markdown(f'<div class="os-section-title">{title}</div>', unsafe_allow_html=True)
+        items = list(data.items()) if hasattr(data, "items") else list(enumerate(data))
+        max_val = max((v for _, v in items), default=0) or 1
+        palette = ["#6366F1", "#22D3EE", "#34D399", "#FBBF24", "#F472B6", "#A78BFA"]
+        bars_html = ""
+        for i, (label, val) in enumerate(items):
+            pct = (val / max_val) * 100
+            color = palette[i % len(palette)]
+            bars_html += f"""
             <div style="margin-bottom:0.7rem;">
                 <div style="display:flex; justify-content:space-between; font-size:0.82rem; color:var(--os-text-dim); margin-bottom:0.28rem;">
-                    <span>{_label}</span><span style="color:#FFFFFF; font-weight:700;">{_val}</span>
+                    <span>{label}</span><span style="color:#FFFFFF; font-weight:700;">{val}</span>
                 </div>
                 <div style="background:rgba(255,255,255,0.07); border-radius:8px; height:11px; overflow:hidden;">
-                    <div style="width:{_pct}%; height:100%; background:linear-gradient(90deg,{_color},#22D3EE);
-                                border-radius:8px; box-shadow:0 0 12px {_color}66;"></div>
+                    <div style="width:{pct}%; height:100%; background:linear-gradient(90deg,{color},#22D3EE);
+                                border-radius:8px; box-shadow:0 0 12px {color}66;"></div>
                 </div>
             </div>
             """
-        st.markdown(f'<div>{_bars_html}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div>{bars_html}</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        if stats["by_persona"]:
+            _render_bar_chart("📊 Queries by mode", stats["by_persona"])
+    with chart_col2:
+        if stats.get("by_language"):
+            _render_bar_chart("🌐 Queries by language", stats["by_language"])
+
 
     st.markdown('<div class="os-card">', unsafe_allow_html=True)
     st.markdown('<div class="os-section-title">🕳️ Recent knowledge gaps</div>', unsafe_allow_html=True)
@@ -913,7 +929,17 @@ with tab_faq:
             st.warning("No documents indexed in this space yet.")
         else:
             with st.spinner("Reading through the knowledge base and drafting an FAQ..."):
-                faq_md = generate_faq(vs, llm, active_space)
+                try:
+                    faq_md = generate_faq(vs, llm, active_space, language=answer_language)
+                except Exception as e:
+                    faq_md = None
+                    st.error(
+                        "⚠️ The AI service hit an error while generating the FAQ. "
+                        "This is almost always a temporary rate limit or quota issue "
+                        "on the free Gemini API tier — wait about a minute and try again."
+                    )
+                    with st.expander("Technical details (for debugging)"):
+                        st.code(f"{type(e).__name__}: {e}")
             if faq_md:
                 st.markdown('<div class="os-card">', unsafe_allow_html=True)
                 st.markdown(faq_md)
